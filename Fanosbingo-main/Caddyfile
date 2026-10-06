@@ -1,0 +1,38 @@
+# Yena Bingo — production reverse proxy.
+#
+# Caddy terminates TLS, gets/renews its Let's Encrypt certificate
+# automatically (no certbot, no cron job, no manual renewal — this is the
+# entire reason Caddy was chosen over nginx+certbot or Traefik for a
+# single-domain deployment like this one), and redirects all plain HTTP to
+# HTTPS automatically as well. Telegram Mini Apps require HTTPS to load at
+# all, so this file is what makes that true in production.
+#
+# Set DOMAIN (and CADDY_EMAIL, used for Let's Encrypt expiry notices) in the
+# environment before starting this stack — see docker-compose.prod.yml.
+# DNS for DOMAIN must already point at this server's public IP before first
+# start, or certificate issuance will fail.
+{
+	email {$CADDY_EMAIL}
+}
+
+{$DOMAIN} {
+	encode gzip zstd
+
+	# Backend API — proxied under /api, matching CORS_ALLOWED_ORIGINS /
+	# VITE_API_BASE_URL already being "<domain>/api" elsewhere in this project.
+	handle_path /api/* {
+		reverse_proxy backend:3000
+	}
+
+	# Everything else — the React Mini App served by the frontend's nginx.
+	handle {
+		reverse_proxy frontend:80
+	}
+
+	# HSTS only makes sense once TLS is confirmed working end-to-end — Caddy
+	# is the only place in this stack that terminates TLS, so it's the only
+	# place this header belongs.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+}

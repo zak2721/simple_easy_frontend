@@ -1,0 +1,13 @@
+-- Production Readiness Audit (Medium): an audit row's `admin_id` is the
+-- IMPERSONATED target for every ordinary action during a Super Admin
+-- "viewing as" session — only IMPERSONATION_STARTED/ENDED rows previously
+-- named the real actor. This column captures the real actor on every row,
+-- stamped automatically by AuditService.log() from AsyncLocalStorage
+-- (see common/tenant/tenant-context.ts / TenantContextInterceptor), not by
+-- each of its ~100 call sites.
+--
+-- Pure metadata-only ADD COLUMN (nullable, no default needed since NULL is
+-- the correct value for every non-impersonated action, past and future) —
+-- audit_logs is append-only (prevent_ledger_mutation trigger blocks
+-- UPDATE/DELETE), and this does not fire that trigger or touch existing rows.
+ALTER TABLE "audit_logs" ADD COLUMN "impersonated_by_admin_id" TEXT;

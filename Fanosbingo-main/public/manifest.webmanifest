@@ -1,0 +1,14 @@
+{
+  "name": "የኛ bingo",
+  "short_name": "የኛ",
+  "description": "Live 75-ball Bingo on Telegram. ETB 5 and ETB 10 rooms, manual Telebirr deposits and withdrawals.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1220",
+  "theme_color": "#0b7d3e",
+  "icons": [
+    { "src": "/logo-mark.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

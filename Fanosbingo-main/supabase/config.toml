@@ -1,0 +1,40 @@
+# የኛ bingo — Supabase local/CLI config.
+# `project_id` is only a local label; `supabase link --project-ref <ref>` targets a real project.
+project_id = "yena-bingo"
+
+[db]
+port = 54322
+major_version = 15
+
+[db.pooler]
+enabled = false
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[studio]
+enabled = true
+port = 54323
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+# የኛ players authenticate via Telegram (not Supabase Auth); admin auth is
+# custom (admin_users). Supabase Auth stays enabled only for tooling.
+site_url = "http://localhost:5173"
+
+[realtime]
+enabled = true
+
+[edge_runtime]
+enabled = true
+
+[analytics]
+enabled = false

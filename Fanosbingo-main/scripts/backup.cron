@@ -1,0 +1,11 @@
+# Yena Bingo — production backup schedule.
+#
+# Install with: crontab -e   (as the user that can run `docker compose`
+# against docker-compose.prod.yml, typically root or a docker-group user)
+# then paste the line below, adjusting the repo path.
+#
+# Daily at 03:15 server time — chosen to sit outside the hours real
+# Ethiopia-facing traffic is expected to be highest, so a multi-minute
+# pg_dump doesn't compete with the app for DB I/O during peak play.
+
+15 3 * * * cd /opt/yena-bingo && BACKUP_GPG_RECIPIENT=ops@yourdomain.com ./scripts/backup.sh >> /var/log/yena-bingo-backup.log 2>&1

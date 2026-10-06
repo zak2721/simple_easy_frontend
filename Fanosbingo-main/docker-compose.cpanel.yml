@@ -1,0 +1,92 @@
+# Production stack for a server where Apache/cPanel already owns ports
+# 80/443 (a single shared IP with other cPanel-hosted sites). Postgres,
+# Redis, and both app containers are internal/localhost-only — Apache is
+# the public entrypoint and reverse-proxies to backend:3000 and
+# frontend:8080 on 127.0.0.1. See docs/YENA_BINGO_CPANEL_WHM_DEPLOYMENT.md.
+#
+# If you later get a dedicated IP for this domain, use docker-compose.prod.yml
+# instead — that variant runs its own Caddy container with automatic HTTPS
+# and needs no Apache involvement at all.
+#
+# Usage:
+#   cp .env.example .env.production   # fill in real secrets
+#   echo "DOMAIN=bingo.yourdomain.com" >> .env.production
+#   docker compose --env-file .env.production -f docker-compose.cpanel.yml up -d --build
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-yena_bingo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No `ports:` — reachable only from other containers on this network.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-yena_bingo}
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+      CORS_ALLOWED_ORIGINS: https://${DOMAIN:?DOMAIN must be set}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET must be set}
+      ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:?TELEGRAM_BOT_USERNAME must be set}
+      # TelegramService.verifyWebhookSecret() fails CLOSED when unset, so
+      # every webhook delivery would be rejected as Unauthorized without this.
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?TELEGRAM_WEBHOOK_SECRET must be set — generate with `openssl rand -hex 32`}
+      # Encrypts operators' own bot tokens at rest (openssl rand -base64 32). Required once any
+      # non-default operator has a bot; optional until then. Back it up apart from DB dumps.
+      PLATFORM_ENCRYPTION_KEY: ${PLATFORM_ENCRYPTION_KEY:-}
+      YENA_BINGO_APP_URL: https://${DOMAIN:?DOMAIN must be set}
+      ALLOW_UNVERIFIED_TELEGRAM: "false"
+      RECEIPTS_STORAGE_PATH: /app/storage/receipts
+      PUBLIC_STORAGE_PATH: /app/storage/public
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    volumes:
+      - receipts_data:/app/storage/receipts
+      - public_storage_data:/app/storage/public
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: https://${DOMAIN:?DOMAIN must be set}/api
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:8080:80"
+
+volumes:
+  postgres_data:
+  receipts_data:
+  public_storage_data:

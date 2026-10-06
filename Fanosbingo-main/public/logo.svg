@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 200" role="img" aria-label="የኛ bingo (placeholder logo)">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12a150"/>
+      <stop offset="1" stop-color="#0b7d3e"/>
+    </linearGradient>
+  </defs>
+  <rect width="640" height="200" rx="28" fill="url(#g)"/>
+  <circle cx="104" cy="100" r="54" fill="#fff"/>
+  <path d="M104 60l14 10-5 17h-18l-5-17z" fill="#0b7d3e"/>
+  <path d="M104 140l-14-10 5-17h18l5 17z" fill="#0b7d3e"/>
+  <path d="M150 96h14v8h-14z M156 90h8v20h-8z" fill="#0b7d3e"/>
+  <text x="192" y="92" font-family="Nyala, Segoe UI, Arial, sans-serif" font-size="52" font-weight="800" fill="#ffffff" letter-spacing="1">የኛ</text>
+  <text x="192" y="146" font-family="Segoe UI, Arial, sans-serif" font-size="46" font-weight="700" fill="#ffd166" letter-spacing="10">bingo</text>
+  <text x="192" y="176" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="500" fill="#d7f5e3" letter-spacing="1">PLACEHOLDER — replace public/logo.svg &amp; logo.png with the official artwork</text>
+</svg>

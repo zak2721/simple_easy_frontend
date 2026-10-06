@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="የኛ bingo mark (placeholder)">
+  <defs>
+    <linearGradient id="m" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12a150"/>
+      <stop offset="1" stop-color="#0b7d3e"/>
+    </linearGradient>
+  </defs>
+  <rect width="200" height="200" rx="44" fill="url(#m)"/>
+  <circle cx="100" cy="94" r="52" fill="#fff"/>
+  <path d="M100 52l16 12-6 20h-20l-6-20z" fill="#0b7d3e"/>
+  <path d="M100 136l-16-12 6-20h20l6 20z" fill="#0b7d3e"/>
+  <text x="100" y="178" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="800" fill="#ffd166">bingo</text>
+</svg>

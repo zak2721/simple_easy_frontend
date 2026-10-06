@@ -1,0 +1,1247 @@
+// የኛ bingo — Prisma schema
+// Ported from the Supabase/Postgres schema documented in SUPABASE_MIGRATION_REPORT.md.
+// Business rules are pinned by CHECK constraints / enums wherever the DB can enforce them,
+// because the backend must never trust the frontend for money or game-critical state.
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" already resolves to the correct musl engine when `prisma
+  // generate` runs INSIDE the Alpine container during the Docker build
+  // (see backend/Dockerfile) — no explicit binaryTargets needed for that.
+  // The runtime error this bug produced ("failed to detect libssl/openssl")
+  // was actually just Alpine missing the openssl package, fixed in the
+  // Dockerfile instead. Discovered by actually running docker compose up,
+  // not by reading the Dockerfile.
+}
+
+// Phase 7 Part 2 (RLS activation): the app's own PrismaClient (`url`)
+// connects as the unprivileged `app_runtime` role so Postgres RLS
+// (migration 20260926090000_row_level_security) is actually enforced.
+// `prisma migrate deploy`/`generate`/`db push` use `directUrl` instead — the
+// superuser connection — since app_runtime is deliberately not granted
+// schema-modification rights (and _prisma_migrations is excluded from its
+// grants entirely). See docs/YENA_BINGO_MULTI_OPERATOR_ARCHITECTURE.md.
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("MIGRATE_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription plans — named bundles of limits + feature flags. Rows, not
+// hard-coded enum values, so a Super Admin can add plans without a deploy.
+// See docs/YENA_BINGO_SAAS_PLATFORM_ARCHITECTURE.md §2.
+// ---------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  trialing
+  active
+  past_due
+  cancelled
+}
+
+model SubscriptionPlan {
+  id                String   @id @default(uuid())
+  key               String   @unique
+  name              String
+  monthlyPriceMinor Int?     @map("monthly_price_minor")
+  currency          String?  @default("ETB")
+  /// JSON object matching LimitsService.LIMIT_DEFAULTS keys, e.g. {"MAX_ROOMS":2,"MAX_STAFF":5}
+  limits            Json     @default("{}")
+  /// Feature flags this plan unlocks, e.g. ["REFERRALS","CUSTOM_DOMAIN"]
+  features          String[] @default([])
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  operators             Operator[]
+  subscriptionPayments  SubscriptionPayment[]
+
+  @@map("subscription_plans")
+}
+
+// ---------------------------------------------------------------------------
+// Content pages — long-form branded text per operator (About, Terms, etc.).
+// Same shape as FaqEntry/GameRule. operatorId null = platform-wide default.
+// See docs/YENA_BINGO_SAAS_PLATFORM_ARCHITECTURE.md §2.
+// ---------------------------------------------------------------------------
+
+enum ContentPageType {
+  ABOUT
+  TERMS_AND_CONDITIONS
+  RESPONSIBLE_GAMING
+  GAME_INSTRUCTIONS
+}
+
+model OperatorContentPage {
+  id               String          @id @default(uuid())
+  operatorId       String?         @map("operator_id")
+  operator         Operator?       @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  pageType         ContentPageType @map("page_type")
+  title            String
+  bodyMarkdown     String          @map("body_markdown")
+  updatedAt        DateTime        @updatedAt @map("updated_at")
+  updatedByAdminId String?         @map("updated_by_admin_id")
+
+  @@unique([operatorId, pageType])
+  @@index([operatorId, pageType])
+  @@map("operator_content_pages")
+}
+
+// ---------------------------------------------------------------------------
+// Operators (white-label tenants). See docs/YENA_BINGO_MULTI_OPERATOR_ARCHITECTURE.md.
+//
+// Every pre-existing row belongs to the default operator
+// 00000000-0000-0000-0000-000000000001 (slug "yena"), back-filled by a
+// constant column DEFAULT in 20260925120000_operators_foundation (no UPDATE,
+// so wallet_ledger/audit_logs' prevent_ledger_mutation trigger never fired).
+// Those defaults were dropped in 20260925140000: every write now passes
+// operatorId explicitly, so a forgotten one fails loudly instead of silently
+// landing in the default operator.
+// ---------------------------------------------------------------------------
+
+enum OperatorStatus {
+  active
+  suspended
+  disabled
+}
+
+enum GameMode {
+  continuous
+  scheduled
+}
+
+model Operator {
+  id     String         @id @default(uuid())
+  slug   String         @unique
+  name   String
+  status OperatorStatus @default(active)
+
+  ownerAdminId String?  @map("owner_admin_id")
+  gameMode     GameMode @default(continuous) @map("game_mode")
+
+  /// Operator's own Telegram bot. Null only for the default operator, which
+  /// uses TELEGRAM_BOT_TOKEN from the environment. Encrypted with
+  /// PLATFORM_ENCRYPTION_KEY (AES-256-GCM); never returned by any API.
+  botUsername       String? @map("bot_username")
+  botTokenEncrypted String? @map("bot_token_encrypted")
+  webhookSecret     String? @map("webhook_secret")
+
+  /// SaaS subscription plan assigned by Super Admin. Null = no plan (legacy / trial).
+  subscriptionPlanId    String?            @map("subscription_plan_id")
+  subscriptionPlan      SubscriptionPlan?  @relation(fields: [subscriptionPlanId], references: [id], onDelete: Restrict)
+  subscriptionStatus    SubscriptionStatus @default(trialing) @map("subscription_status")
+  subscriptionStartedAt DateTime?          @map("subscription_started_at")
+  subscriptionExpiresAt DateTime?          @map("subscription_expires_at")
+
+  /// Business contact captured at onboarding — belongs on the operator row
+  /// (not AdminUser) so it survives ownership transfers.
+  businessPhone String? @map("business_phone")
+  businessEmail String? @map("business_email")
+
+  suspendedReason  String?   @map("suspended_reason")
+  suspendedAt      DateTime? @map("suspended_at")
+  createdByAdminId String?   @map("created_by_admin_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  settings             OperatorSetting[]
+  limits               OperatorLimit[]
+  branding             OperatorBranding?
+  rooms                OperatorRoom[]
+  slots                CartelaSlot[]
+  admins               AdminUser[]
+  players              TelegramUser[]
+  games                Game[]
+  cartelas             GameCartela[]
+  ledger               WalletLedgerEntry[]
+  deposits             ManualDeposit[]
+  withdrawals          WithdrawalRequest[]
+  bonuses              BonusGrant[]
+  referrals            Referral[]
+  auditLogs            AuditLog[]
+  themes               Theme[]
+  gameRules            GameRule[]
+  alerts               FinancialAlert[]
+  approvals            ApprovalRequest[]
+  tickets              SupportTicket[]
+  faqEntries           FaqEntry[]
+  notifications        Notification[]
+  contentPages         OperatorContentPage[]
+  subscriptionPayments SubscriptionPayment[]
+
+  @@index([status])
+  @@map("operators")
+}
+
+/// Operator-level override of a platform `settings` key. Lookup order:
+/// operator_settings -> settings -> SettingsService.DEFAULTS.
+model OperatorSetting {
+  operatorId       String   @map("operator_id")
+  operator         Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  key              String
+  value            String
+  updatedByAdminId String?  @map("updated_by_admin_id")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@id([operatorId, key])
+  @@map("operator_settings")
+}
+
+/// Ceilings/feature switches the Super Admin imposes on an operator
+/// (e.g. MAX_CARTELA_PRICE, MAX_ROOMS, FEATURE_REFERRALS_ENABLED).
+model OperatorLimit {
+  operatorId String   @map("operator_id")
+  operator   Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  key        String
+  value      String
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@id([operatorId, key])
+  @@map("operator_limits")
+}
+
+/// Currently-approved branding. Pending changes live in approval requests.
+model OperatorBranding {
+  operatorId     String   @id @map("operator_id")
+  operator       Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  displayName    String   @map("display_name")
+  logoUrl        String?  @map("logo_url")
+  themeId        String?  @map("theme_id")
+  theme          Theme?   @relation("BrandingTheme", fields: [themeId], references: [id], onDelete: SetNull)
+  welcomeMessage String?  @map("welcome_message")
+  bannerUrls     String[] @default([]) @map("banner_urls")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("operator_branding")
+}
+
+/// Replaces the hard-coded etb5/etb10 rooms. `code` is the stable key; the
+/// default operator's rooms use codes "etb5"/"etb10" so they map 1:1 onto the
+/// legacy RoomType enum still stored on older game_cartelas rows.
+model OperatorRoom {
+  id           String   @id @default(uuid())
+  operatorId   String   @map("operator_id")
+  operator     Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  code         String
+  name         String
+  price        Decimal  @db.Decimal(14, 2)
+  capacity     Int
+  maxPerPlayer Int?     @map("max_per_player")
+  isActive     Boolean  @default(true) @map("is_active")
+  sortOrder    Int      @default(0) @map("sort_order")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  slots    CartelaSlot[]
+  cartelas GameCartela[]
+
+  @@unique([operatorId, code])
+  @@map("operator_rooms")
+}
+
+/// One row per sellable cartela number in a room. Grids are still generated
+/// fresh per purchase with crypto.randomInt: a slot is a number, not a grid.
+model CartelaSlot {
+  id                String       @id @default(uuid())
+  operatorId        String       @map("operator_id")
+  operator          Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  roomId            String       @map("room_id")
+  room              OperatorRoom @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  cartelaNumber     Int          @map("cartela_number")
+  isActive          Boolean      @default(true) @map("is_active")
+  deactivatedReason String?      @map("deactivated_reason")
+
+  @@unique([roomId, cartelaNumber])
+  @@index([operatorId])
+  @@map("cartela_slots")
+}
+
+// ---------------------------------------------------------------------------
+// Players / Telegram identity
+// ---------------------------------------------------------------------------
+
+enum PlayerStatus {
+  active
+  suspended
+  banned
+}
+
+model TelegramUser {
+  id             String   @id @default(uuid())
+  operatorId     String   @map("operator_id")
+  operator       Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  /// Unique per operator, not globally: the same Telegram user has a separate
+  /// account and wallet with each operator they play at.
+  telegramUserId BigInt   @map("telegram_user_id")
+  username       String?
+  firstName      String?  @map("first_name")
+  lastName       String?  @map("last_name")
+  languageCode   String   @default("am") @map("language_code")
+
+  /// Audit finding ADMIN-1 (Critical): there was no way to suspend/ban a
+  /// fraudulent or abusive player anywhere in the system. `suspended` blocks
+  /// login/deposits/withdrawals/gameplay but is reversible; `banned` is the
+  /// same block flagged as a considered, harder decision (still reversible by
+  /// an admin — the platform never destroys the underlying financial history).
+  status                 PlayerStatus @default(active)
+  statusReason           String?      @map("status_reason")
+  statusChangedAt        DateTime?    @map("status_changed_at")
+  statusChangedByAdminId String?      @map("status_changed_by_admin_id")
+
+  /// Short shareable referral code (e.g. "7XPQR9") — nullable only until the
+  /// one-time backfill (backend/scripts/backfill-referral-codes.ts) populates
+  /// existing rows, then tightened to NOT NULL. Every new row gets one at
+  /// creation (see AuthService.telegramLogin). Additive alongside the legacy
+  /// numeric-telegramUserId-as-code scheme, never replacing it — old links
+  /// keep working forever (see ReferralsService.recordReferral).
+  referralCode String @unique @map("referral_code")
+
+  /// Sybil/bonus-farming defense (lightweight heuristic, not hard identity
+  /// verification): captured once at account creation, never updated
+  /// afterward — a fingerprint of where this account came from, not a live
+  /// session field. BonusService checks how many SIGNUP/REFERRAL_* grants
+  /// share either value across accounts before paying one out (see
+  /// BonusService.exceedsFingerprintCap). Both nullable: a pre-existing
+  /// account (created before this existed) or a request with no device id
+  /// simply can't be evaluated against the cap, which fails open (never
+  /// blocks registration or gameplay — only a bonus payout).
+  signupIp       String? @map("signup_ip")
+  signupDeviceId String? @map("signup_device_id")
+
+  depositedBalance Decimal @default(0) @map("deposited_balance") @db.Decimal(14, 2)
+  wonBalance       Decimal @default(0) @map("won_balance") @db.Decimal(14, 2)
+  bonusBalance     Decimal @default(0) @map("bonus_balance") @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  cartelas       GameCartela[]
+  ledgerEntries  WalletLedgerEntry[]
+  deposits       ManualDeposit[]
+  withdrawals    WithdrawalRequest[]
+  bonuses        BonusGrant[]
+  refreshTokens  PlayerRefreshToken[]
+  supportTickets SupportTicket[]
+  referralsMade  Referral[]           @relation("ReferralInviter")
+  referredAs     Referral?            @relation("ReferralInvited")
+
+  /// Personal theme choice; null = use whatever the Theme catalog currently
+  /// resolves as the system default/scheduled theme (see ThemeService.getEffectiveTheme).
+  /// Mirrors the existing languageCode scalar-preference-column convention —
+  /// no separate one-row-per-user "theme_settings" table.
+  selectedThemeId String? @map("selected_theme_id")
+  selectedTheme   Theme?  @relation(fields: [selectedThemeId], references: [id], onDelete: SetNull)
+
+  @@unique([operatorId, telegramUserId])
+  @@index([status])
+  @@index([telegramUserId])
+  @@index([operatorId, signupIp])
+  @@index([operatorId, signupDeviceId])
+  @@map("telegram_users")
+}
+
+model PlayerRefreshToken {
+  id             String       @id @default(uuid())
+  telegramUserId String       @map("telegram_user_id")
+  user           TelegramUser @relation(fields: [telegramUserId], references: [id], onDelete: Cascade)
+  tokenHash      String       @map("token_hash")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  expiresAt      DateTime     @map("expires_at")
+  revokedAt      DateTime?    @map("revoked_at")
+  /// Rotation chain. Null only on tokens issued before reuse detection existed;
+  /// those start a family of their own on first refresh.
+  familyId       String?      @map("family_id")
+  replacedById   String?      @map("replaced_by_id")
+
+  @@index([telegramUserId])
+  @@index([familyId])
+  /// Audit finding DB-2: refreshPlayerToken() does findFirst({where:{tokenHash}})
+  /// on every single token refresh — without this index it's a full table scan
+  /// once the table grows, and nothing purges old rows (see the cleanup cron
+  /// in AuthService), so it only gets worse over time.
+  @@index([tokenHash])
+  @@map("player_refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Rooms / Games / Cartelas (the 75-ball Bingo engine)
+// ---------------------------------------------------------------------------
+
+enum RoomType {
+  etb5
+  etb10
+}
+
+/// scheduled = created in advance by the operator, not yet on sale;
+/// the engine promotes it to waiting (sales open) at salesOpenAt.
+enum GameStatus {
+  waiting
+  playing
+  finished
+  scheduled
+}
+
+model Game {
+  id         String     @id @default(uuid())
+  operatorId String     @map("operator_id")
+  operator   Operator   @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  gameNumber Int        @default(autoincrement()) @map("game_number")
+  status     GameStatus @default(waiting)
+
+  currentNumber Int?  @map("current_number")
+  calledNumbers Int[] @default([]) @map("called_numbers")
+
+  winnerIds         String[] @default([]) @map("winner_ids")
+  winnerPrizeEach   Decimal? @map("winner_prize_each") @db.Decimal(14, 2)
+  winnerPrizeAmount Decimal? @map("winner_prize_amount") @db.Decimal(14, 2)
+  houseShareAmount  Decimal? @map("house_share_amount") @db.Decimal(14, 2)
+  winnerPayouts     Json?    @map("winner_payouts")
+  totalPot          Decimal  @default(0) @map("total_pot") @db.Decimal(14, 2)
+
+  startsAt          DateTime  @map("starts_at")
+  selectionClosedAt DateTime? @map("selection_closed_at")
+  startedAt         DateTime? @map("started_at")
+  finishedAt        DateTime? @map("finished_at")
+  returnToLobbyAt   DateTime? @map("return_to_lobby_at")
+  claimWindowStart  DateTime? @map("claim_window_start")
+
+  /// Which patterns win this game (subset of row, column, diagonal, corners,
+  /// full_house). Locked once the first cartela is sold.
+  winningPatterns  String[]  @default(["row", "column", "diagonal", "corners"]) @map("winning_patterns")
+  /// Operator-scheduled games: when sales open (status scheduled -> waiting).
+  salesOpenAt      DateTime? @map("sales_open_at")
+  createdByAdminId String?   @map("created_by_admin_id")
+  /// Set when a game was cancelled (status finished + everyone refunded) rather than played.
+  cancelledAt      DateTime? @map("cancelled_at")
+  cancelledReason  String?   @map("cancelled_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  cartelas GameCartela[]
+
+  @@index([status])
+  @@index([operatorId, status])
+  @@map("games")
+}
+
+/// One row per cartela a player owns in a game (a player may own up to
+/// MAX_CARTELAS_PER_PLAYER across BOTH rooms in the same game — see
+/// CardsService.assertUnderGlobalLimit, which is the backend-authoritative
+/// enforcement of business rule §9/§10 in PRODUCTION_MIGRATION_REPORT.md).
+model GameCartela {
+  id     String @id @default(uuid())
+  gameId String @map("game_id")
+  /// DB audit finding (Medium): was `onDelete: Cascade` — inconsistent with
+  /// this schema's "never destroy financial history" convention applied to
+  /// every other relation touching purchased/paid records. No code path
+  /// deletes a Game today, so this was dormant, but Cascade here would
+  /// silently destroy paid cartela records (entryPrice, cardNumbers,
+  /// disqualification history) the moment any future admin tool or manual
+  /// cleanup deleted a Game row. Restrict matches GameCartela.user below.
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Restrict)
+
+  telegramUserId String       @map("telegram_user_id")
+  user           TelegramUser @relation(fields: [telegramUserId], references: [id])
+
+  operatorId String       @map("operator_id")
+  operator   Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  roomId     String       @map("room_id")
+  room       OperatorRoom @relation(fields: [roomId], references: [id], onDelete: Restrict)
+
+  /// Legacy: set only for rooms coded etb5/etb10. roomId is authoritative.
+  roomType      RoomType? @map("room_type")
+  cartelaNumber Int       @map("cartela_number")
+  entryPrice    Decimal   @map("entry_price") @db.Decimal(14, 2)
+
+  /// 5x5 grid, generated fresh per purchase with a CSPRNG (crypto.randomInt) —
+  /// deliberately NOT a deterministic per-card-number layout. See
+  /// PRODUCTION_MIGRATION_REPORT.md "Conflict resolutions" #1.
+  cardNumbers Json @map("card_numbers")
+  markedCells Json @default("[]") @map("marked_cells")
+
+  reservedAt           DateTime  @default(now()) @map("reserved_at")
+  reservationExpiresAt DateTime  @map("reservation_expires_at")
+  confirmedAt          DateTime? @map("confirmed_at")
+
+  isDisqualified Boolean @default(false) @map("is_disqualified")
+  winningPattern Json?   @map("winning_pattern")
+
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  /// Backstop against two players buying the same number in the same room of the same game.
+  @@unique([gameId, roomId, cartelaNumber], name: "uniq_game_room_cartela")
+  @@index([gameId, telegramUserId])
+  /// DB audit finding (Medium): admin.service.ts's playerCartelas() filters
+  /// by telegramUserId ALONE (no gameId) — the composite index above has
+  /// gameId as its leading column, so a telegramUserId-only query can't use
+  /// it (leftmost-prefix rule) and falls back to a full table scan.
+  @@index([telegramUserId])
+  @@index([operatorId])
+  @@index([roomId])
+  @@map("game_cartelas")
+}
+
+// ---------------------------------------------------------------------------
+// Financial ledger — immutable. See WalletService: no service method ever
+// exposes update/delete on this model; a DB-level trigger (see
+// prisma/migrations/..._ledger_immutability/migration.sql) additionally
+// revokes UPDATE/DELETE for the application role as defence in depth.
+// ---------------------------------------------------------------------------
+
+enum LedgerEntryType {
+  MANUAL_TELEBIRR_DEPOSIT
+  GAME_ENTRY
+  GAME_REFUND
+  WINNING_CREDIT
+  HOUSE_REVENUE
+  WITHDRAWAL_HOLD
+  WITHDRAWAL_PAID
+  WITHDRAWAL_RELEASE
+  BONUS_GRANT
+  BONUS_STAKE
+  BONUS_EXPIRED
+  ADJUSTMENT
+}
+
+enum LedgerDirection {
+  credit
+  debit
+}
+
+model WalletLedgerEntry {
+  id             String        @id @default(uuid())
+  telegramUserId String?       @map("telegram_user_id")
+  /// DB audit finding (High): telegramUserId is nullable (HOUSE_REVENUE
+  /// entries deliberately have no user) so Prisma's DEFAULT onDelete for an
+  /// optional relation is SetNull — but the `wallet_ledger` immutability
+  /// trigger (migration 20260919032018_ledger_immutability) unconditionally
+  /// blocks UPDATE on this table, and SetNull's delete-time behavior IS an
+  /// UPDATE. Deleting a TelegramUser with ledger rows would hit that trigger
+  /// and hard-fail with an opaque Postgres error instead of a clean
+  /// SetNull. Explicit Restrict matches every sibling relation off
+  /// TelegramUser (GameCartela, ManualDeposit, WithdrawalRequest,
+  /// BonusGrant, Referral all Restrict) — no code path deletes a user today,
+  /// but this must be correct before any future delete/GDPR-erase feature.
+  user           TelegramUser? @relation(fields: [telegramUserId], references: [id], onDelete: Restrict)
+
+  /// Every money movement belongs to exactly one operator — including
+  /// HOUSE_REVENUE rows, which have no player to infer it from.
+  operatorId String   @map("operator_id")
+  operator   Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  entryType LedgerEntryType @map("entry_type")
+  direction LedgerDirection
+  amount    Decimal         @db.Decimal(14, 2)
+
+  relatedEntityType String? @map("related_entity_type")
+  relatedEntityId   String? @map("related_entity_id")
+
+  note      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([telegramUserId])
+  @@index([entryType])
+  /// Audit finding DB-3: reconciliation/finance-report queries filter by
+  /// "every ledger entry tied to game X / deposit Y" — only telegramUserId
+  /// and entryType were indexed individually before this.
+  @@index([relatedEntityType, relatedEntityId])
+  /// DB audit finding (High): finance.service.ts's dashboard/period-snapshot
+  /// queries filter this exact combination (entryType + createdAt range) on
+  /// the single fastest-growing table in the schema — every financial event
+  /// writes here. Neither column's individual index covers this compound
+  /// filter efficiently at scale.
+  @@index([entryType, createdAt])
+  @@index([operatorId, createdAt])
+  @@map("wallet_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Manual Telebirr deposits / withdrawals
+// ---------------------------------------------------------------------------
+
+enum DepositStatus {
+  pending
+  approved
+  rejected
+  cancelled
+}
+
+model ManualDeposit {
+  id             String       @id @default(uuid())
+  telegramUserId String       @map("telegram_user_id")
+  user           TelegramUser @relation(fields: [telegramUserId], references: [id])
+  operatorId     String       @map("operator_id")
+  operator       Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  amount          Decimal @db.Decimal(14, 2)
+  receiptPath     String? @map("receipt_path")
+  receiptMimeType String? @map("receipt_mime_type")
+  notes           String? @map("notes")
+
+  /// Finding DEP-1 (High): the Telebirr transaction reference from the
+  /// player's SMS/receipt. Nullable at the DB level for backward compatibility
+  /// with any pre-existing rows, but SubmitDepositDto requires it for every
+  /// new submission going forward. A partial unique index (see migration
+  /// 20260920190000_deposit_telebirr_reference, same pattern as
+  /// uniq_single_super_admin) enforces "at most one APPROVED deposit per
+  /// reference" at the database level — the same physical payment can be
+  /// submitted as two pending rows, but only one of them can ever be approved.
+  telebirrReference String? @map("telebirr_reference")
+
+  status            DepositStatus @default(pending)
+  submittedAt       DateTime      @default(now()) @map("submitted_at")
+  reviewedByAdminId String?       @map("reviewed_by_admin_id")
+  reviewedAt        DateTime?     @map("reviewed_at")
+  rejectionReason   String?       @map("rejection_reason")
+  adminNote         String?       @map("admin_note")
+
+  @@index([telegramUserId])
+  @@index([status])
+  @@index([operatorId, status])
+  @@map("manual_deposits")
+}
+
+enum WithdrawalStatus {
+  pending
+  approved
+  paid
+  rejected
+  cancelled
+}
+
+model WithdrawalRequest {
+  id             String       @id @default(uuid())
+  telegramUserId String       @map("telegram_user_id")
+  user           TelegramUser @relation(fields: [telegramUserId], references: [id])
+  operatorId     String       @map("operator_id")
+  operator       Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  amount          Decimal @db.Decimal(14, 2)
+  telebirrAccount String  @map("telebirr_account")
+  notes           String? @map("notes")
+
+  status            WithdrawalStatus @default(pending)
+  requestedAt       DateTime         @default(now()) @map("requested_at")
+  reviewedByAdminId String?          @map("reviewed_by_admin_id")
+  reviewedAt        DateTime?        @map("reviewed_at")
+  paidAt            DateTime?        @map("paid_at")
+  paymentProofPath  String?          @map("payment_proof_path")
+  rejectionReason   String?          @map("rejection_reason")
+  adminNote         String?          @map("admin_note")
+
+  @@index([telegramUserId])
+  @@index([status])
+  @@index([operatorId, status])
+  @@map("withdrawal_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Bonus wallet (registration bonus + wagering requirement — spec §26/§27)
+// ---------------------------------------------------------------------------
+
+enum BonusStatus {
+  active
+  wagered_out
+  expired
+}
+
+model BonusGrant {
+  id             String       @id @default(uuid())
+  telegramUserId String       @map("telegram_user_id")
+  user           TelegramUser @relation(fields: [telegramUserId], references: [id])
+  operatorId     String       @map("operator_id")
+  operator       Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  reason           String // e.g. "SIGNUP", "REFERRAL"
+  campaignId       String?     @map("campaign_id")
+  amount           Decimal     @db.Decimal(14, 2)
+  wageringRequired Decimal     @map("wagering_required") @db.Decimal(14, 2)
+  wageringProgress Decimal     @default(0) @map("wagering_progress") @db.Decimal(14, 2)
+  status           BonusStatus @default(active)
+
+  /// Set at grant time from the BONUS_EXPIRY_DAYS setting. Null = never
+  /// expires (kept nullable so existing pre-this-change grants are
+  /// unaffected — the expiry cron only acts on rows where this is set and past).
+  expiresAt DateTime? @map("expires_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// One signup bonus per user — prevents the exact abuse spec §25 calls out
+  /// ("a user must not be able to repeatedly obtain a new-user bonus").
+  @@unique([telegramUserId, reason], name: "uniq_user_bonus_reason")
+  @@index([status, expiresAt])
+  /// DB audit finding (Medium): referrals.service.ts's reportSummary/myStats
+  /// filter `reason: {startsWith: 'REFERRAL_...'}` — reason has no index
+  /// outside the compound unique key (which requires telegramUserId too, so
+  /// it can't serve a reason-only/reason-prefix scan).
+  @@index([reason])
+  @@index([operatorId])
+  @@map("bonus_grants")
+}
+
+// ---------------------------------------------------------------------------
+// Admin / RBAC
+// ---------------------------------------------------------------------------
+
+enum AdminStatus {
+  active
+  suspended
+  disabled
+}
+
+/// SUPER_ADMIN / ADMIN are platform-level (operator_id NULL). OPERATOR_OWNER
+/// (exactly one per operator) and OPERATOR_STAFF belong to one operator.
+/// Enforced by admins_operator_scope_chk + uniq_operator_owner.
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+  OPERATOR_OWNER
+  OPERATOR_STAFF
+}
+
+/// Flat, direct-assignment RBAC model per the admin-management spec:
+/// exactly one SUPER_ADMIN (unrestricted, enforced in AuthService.adminBootstrap
+/// — bootstrap is the only way to create one, and it only runs once), and any
+/// number of ADMIN accounts whose capabilities come entirely from their own
+/// AdminPermission rows — no intermediate role-preset bucket (that's the
+/// previous Role/RolePermission/AdminUserRole design; removed here in favor
+/// of the simpler per-admin model the spec explicitly asks for).
+model AdminUser {
+  id           String      @id @default(uuid())
+  username     String      @unique
+  passwordHash String      @map("password_hash")
+  fullName     String      @map("full_name")
+  role         AdminRole   @default(ADMIN)
+  status       AdminStatus @default(active)
+
+  /// Null = platform-level account (SUPER_ADMIN / platform ADMIN).
+  /// Set = account belongs to that operator only.
+  operatorId String?   @map("operator_id")
+  operator   Operator? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  createdByAdminId String?   @map("created_by_admin_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  lastLoginAt      DateTime? @map("last_login_at")
+
+  /// Account lockout: consecutive failed logins since the last success.
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  lockedUntil       DateTime? @map("locked_until")
+  passwordChangedAt DateTime? @map("password_changed_at")
+
+  /// TOTP (RFC 6238) two-factor auth. Secret is AES-256-GCM encrypted with
+  /// PLATFORM_ENCRYPTION_KEY (same key/format as an operator's bot token) —
+  /// never stored or returned in plaintext. `totpEnabled` flips true only
+  /// after the admin proves possession by confirming one live code.
+  /// `totpLastUsedCounter` blocks replaying an observed code a second time
+  /// within its validity window.
+  totpSecretEncrypted String?   @map("totp_secret_encrypted")
+  totpEnabled         Boolean   @default(false) @map("totp_enabled")
+  totpVerifiedAt      DateTime? @map("totp_verified_at")
+  totpLastUsedCounter Int?      @map("totp_last_used_counter")
+
+  /// Set true when the account was created with a Super-Admin-generated
+  /// temporary password. JwtAdminStrategy short-circuits every route except
+  /// POST /auth/admin/change-password until the admin clears this flag.
+  mustChangePassword Boolean @default(false) @map("must_change_password")
+
+  /// Self-service opt-in: warning/critical notifications (account lockouts,
+  /// refresh-token reuse, impersonation, ...) are pushed here via this
+  /// admin's own operator's bot (or the platform bot for a platform-level
+  /// admin), on top of the always-on in-app feed. Null = in-app only.
+  telegramAlertChatId String? @map("telegram_alert_chat_id")
+
+  permissions   AdminPermission[]
+  sessions      AdminSession[]
+  refreshTokens AdminRefreshToken[]
+  recoveryCodes AdminRecoveryCode[]
+
+  @@index([operatorId])
+  @@map("admins")
+}
+
+/// Extensible permission catalog — add a row here to add a new permission
+/// with zero architecture changes, per the spec's explicit requirement.
+model Permission {
+  id          String  @id @default(uuid())
+  key         String  @unique // e.g. "VIEW_DEPOSITS"
+  /// "platform" = never grantable to operator accounts; "operator" = usable
+  /// by operator owners/staff, always within their own operator.
+  scope       String  @default("platform")
+  description String?
+
+  admins AdminPermission[]
+
+  @@map("permissions")
+}
+
+/// Direct admin -> permission grant. `enabled` supports "temporarily disable"
+/// without losing the grant record (spec: Super Admin can "temporarily
+/// disable permissions"); a full revoke deletes the row instead.
+model AdminPermission {
+  adminId      String     @map("admin_id")
+  admin        AdminUser  @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  permissionId String     @map("permission_id")
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  enabled          Boolean  @default(true)
+  grantedByAdminId String?  @map("granted_by_admin_id")
+  grantedAt        DateTime @default(now()) @map("granted_at")
+
+  @@id([adminId, permissionId])
+  @@map("admin_permissions")
+}
+
+model AdminSession {
+  id      String    @id @default(uuid())
+  adminId String    @map("admin_id")
+  admin   AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  tokenHash String    @map("token_hash")
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  ipAddress String?   @map("ip_address")
+  userAgent String?   @map("user_agent")
+  deviceId  String?   @map("device_id")
+
+  /// Set only for a Super-Admin-initiated "view as" session (impersonation):
+  /// the real actor behind this session, which otherwise looks exactly like
+  /// the target admin's own session (same sub/permissions/operatorId).
+  /// Never issued a refresh token — it expires on its own short TTL rather
+  /// than rotating forever.
+  impersonatedByAdminId String? @map("impersonated_by_admin_id")
+  impersonationReason   String? @map("impersonation_reason")
+
+  refreshTokens AdminRefreshToken[]
+
+  @@index([adminId])
+  @@map("admin_sessions")
+}
+
+/// Rotating refresh token for an admin session (sent only as an httpOnly
+/// cookie). The session id is the token family: presenting a token that was
+/// already rotated (revokedAt set) means it leaked, so the whole session is
+/// revoked. See AuthService.refreshAdminSession.
+model AdminRefreshToken {
+  id           String       @id @default(uuid())
+  adminId      String       @map("admin_id")
+  admin        AdminUser    @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  sessionId    String       @map("session_id")
+  session      AdminSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tokenHash    String       @map("token_hash")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  expiresAt    DateTime     @map("expires_at")
+  revokedAt    DateTime?    @map("revoked_at")
+  replacedById String?      @map("replaced_by_id")
+
+  @@index([tokenHash])
+  @@index([sessionId])
+  @@map("admin_refresh_tokens")
+}
+
+/// One-time 2FA recovery codes, generated in a batch of 8 whenever TOTP is
+/// enabled (or the batch is regenerated). Each is single-use (`usedAt`) —
+/// lets an admin who lost their authenticator sign in without waiting on a
+/// Super Admin's force-disable. Hashed the same way as a refresh token
+/// (SHA-256 of a high-entropy random value): these are never human-chosen,
+/// so a fast hash is the right tool, same reasoning as everywhere else in
+/// this codebase that hashes a generated secret rather than a password.
+model AdminRecoveryCode {
+  id        String    @id @default(uuid())
+  adminId   String    @map("admin_id")
+  admin     AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  codeHash  String    @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([adminId])
+  @@map("admin_recovery_codes")
+}
+
+/// Every admin and player login attempt, successful or not. Append-only
+/// (prevent_ledger_mutation trigger), same as audit_logs.
+model LoginHistory {
+  id                String   @id @default(uuid())
+  principalType     String   @map("principal_type") // "admin" | "player"
+  principalId       String?  @map("principal_id")
+  operatorId        String?  @map("operator_id")
+  attemptedUsername String?  @map("attempted_username")
+  success           Boolean
+  failureReason     String?  @map("failure_reason")
+  ipAddress         String?  @map("ip_address")
+  userAgent         String?  @map("user_agent")
+  deviceId          String?  @map("device_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@index([principalType, principalId, createdAt])
+  @@index([ipAddress, createdAt])
+  @@index([operatorId, createdAt])
+  @@map("login_history")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log — append-only. See AuditService: no update/delete exposed.
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  actorType     String   @map("actor_type") // "admin" | "system"
+  adminId       String?  @map("admin_id")
+  /// Denormalized snapshot of the admin's username at the time of the action —
+  /// kept even if the admin account is later renamed or deleted, so history
+  /// stays readable (spec: audit rows must record "username", not just an id
+  /// that could later point at nothing).
+  username      String?
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String?  @map("entity_id")
+  previousState Json?    @map("previous_state")
+  newState      Json?    @map("new_state")
+  reason        String?
+  ipAddress     String?  @map("ip_address")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  /// Production Readiness Audit (Medium): set only when this action happened
+  /// during a Super Admin "viewing as" session — the REAL actor, since
+  /// `adminId` above is the impersonated target for every ordinary action
+  /// (only IMPERSONATION_STARTED/ENDED rows previously named both parties).
+  /// Stamped automatically by AuditService.log() from AsyncLocalStorage
+  /// (common/tenant/tenant-context.ts), not passed by each of its ~100 call
+  /// sites — see TenantContextInterceptor.
+  impersonatedByAdminId String? @map("impersonated_by_admin_id")
+
+  /// Role of the acting admin at the time of the action (SUPER_ADMIN, ADMIN, OPERATOR_OWNER, OPERATOR_STAFF, or system).
+  actorRole  String?  @map("actor_role")
+  /// HTTP request correlation id — useful for tracing a single request across log sinks.
+  requestId  String?  @map("request_id")
+
+  /// Operator the action concerns; null = platform-level. Carries a DEFAULT
+  /// for the reason given in the Operators header comment.
+  operatorId String?   @map("operator_id")
+  operator   Operator? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  @@index([entityType, entityId])
+  @@index([operatorId, createdAt])
+  @@index([adminId])
+  /// DB audit finding (High): the main admin "all activity" audit screen
+  /// calls list() with no adminId scope — an unbounded `ORDER BY created_at
+  /// DESC LIMIT n` over this append-only, ever-growing table had no index
+  /// covering the sort column, forcing a full-table sort on every page load.
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Runtime configuration (room prices/capacities, Telebirr account, etc.)
+// ---------------------------------------------------------------------------
+
+model Setting {
+  id          String   @id
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+// ---------------------------------------------------------------------------
+// Referrals — resolved from either the short TelegramUser.referralCode or
+// (legacy, kept for backward compatibility) the raw telegramUserId; see
+// ReferralsService.recordReferral. invitedUserId is unique: one inviter per
+// invited user, ever, enforced at the DB level — the actual anti-fraud defence.
+// ---------------------------------------------------------------------------
+
+model Referral {
+  id            String       @id @default(uuid())
+  inviterUserId String       @map("inviter_user_id")
+  inviter       TelegramUser @relation("ReferralInviter", fields: [inviterUserId], references: [id])
+  invitedUserId String       @unique @map("invited_user_id")
+  invited       TelegramUser @relation("ReferralInvited", fields: [invitedUserId], references: [id])
+  operatorId    String       @map("operator_id")
+  operator      Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  inviterRewarded Boolean @default(false) @map("inviter_rewarded")
+  invitedRewarded Boolean @default(false) @map("invited_rewarded")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([inviterUserId])
+  /// DB audit finding (Medium): reportSummary/exportRows/listForAdmin filter
+  /// and sort by createdAt date-range; the top-referrers groupBy filters
+  /// inviterRewarded. Neither was indexed.
+  @@index([createdAt])
+  @@index([inviterRewarded])
+  @@index([operatorId, createdAt])
+  @@map("referrals")
+}
+
+// ---------------------------------------------------------------------------
+// Game rules — admin-managed, ordered content shown in the Mini App's Help page.
+// ---------------------------------------------------------------------------
+
+model GameRule {
+  id        String  @id @default(uuid())
+  title     String
+  body      String
+  category  String?
+  sortOrder Int     @default(0) @map("sort_order")
+  isActive  Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  /// Every rule belongs to one operator: rule text names rooms and prices, which differ per operator.
+  operatorId String   @map("operator_id")
+  operator   Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  @@index([isActive, sortOrder])
+  @@index([operatorId, isActive, sortOrder])
+  @@map("game_rules")
+}
+
+// ---------------------------------------------------------------------------
+// Contact info (Telegram/phone/WhatsApp/email/support hours) reuses the
+// existing `settings` key/value table (CONTACT_* keys) via ContactCenterModule
+// rather than a separate contact_information table, to avoid duplicating
+// storage for identical data.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Theme system. The frontend's entire palette is already just 8 CSS custom
+// properties (--eds-bg/surface/surface-2/fg/muted/brand/brand-strong/accent)
+// consumed by every screen — a Theme row supplies all 8, applied at runtime
+// via document.documentElement.style.setProperty (see src/lib/theme.tsx),
+// so activating/switching a theme requires zero component changes.
+// No separate "theme_settings" table — see TelegramUser.selectedThemeId.
+// ---------------------------------------------------------------------------
+
+model Theme {
+  id   String @id @default(uuid())
+  name String
+  slug String @unique
+
+  primaryColor    String @map("primary_color")
+  secondaryColor  String @map("secondary_color")
+  backgroundColor String @map("background_color")
+  textColor       String @map("text_color")
+  surfaceColor    String @map("surface_color")
+  surfaceAltColor String @map("surface_alt_color")
+  mutedTextColor  String @map("muted_text_color")
+  accentColor     String @map("accent_color")
+
+  buttonBackgroundColor String? @map("button_background_color")
+  buttonTextColor       String? @map("button_text_color")
+
+  logoUrl   String? @map("logo_url")
+  bannerUrl String? @map("banner_url")
+
+  isActive  Boolean @default(true) @map("is_active")
+  /// At most one row may have isDefault=true at a time — enforced at the
+  /// application layer (ThemeService.setDefault does an atomic
+  /// unset-all-then-set-one inside one transaction), not a DB constraint:
+  /// no partial/conditional unique index precedent exists elsewhere in this
+  /// schema.
+  isDefault Boolean @default(false) @map("is_default")
+
+  scheduledStartAt DateTime? @map("scheduled_start_at")
+  scheduledEndAt   DateTime? @map("scheduled_end_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  selectedByUsers TelegramUser[]
+  brandingUses    OperatorBranding[] @relation("BrandingTheme")
+
+  /// Null = platform theme library, usable by every operator.
+  operatorId String?   @map("operator_id")
+  operator   Operator? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  @@index([isActive])
+  @@index([operatorId])
+  @@map("themes")
+}
+
+// ---------------------------------------------------------------------------
+// Financial alerts — stored, not just pushed to a browser tab, so they stay
+// auditable (spec: "Do not rely only on browser notifications").
+// ---------------------------------------------------------------------------
+
+enum FinancialAlertType {
+  OLD_UNPAID_WITHDRAWAL
+  LARGE_WITHDRAWAL
+  LEDGER_WALLET_MISMATCH
+}
+
+model FinancialAlert {
+  id                    String             @id @default(uuid())
+  type                  FinancialAlertType
+  severity              String             @default("warning") // "info" | "warning" | "critical"
+  message               String
+  relatedEntityType     String?            @map("related_entity_type")
+  relatedEntityId       String?            @map("related_entity_id")
+  createdAt             DateTime           @default(now()) @map("created_at")
+  acknowledgedAt        DateTime?          @map("acknowledged_at")
+  acknowledgedByAdminId String?            @map("acknowledged_by_admin_id")
+
+  operatorId String?   @map("operator_id")
+  operator   Operator? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  /// Prevents the alert generator from re-raising the exact same condition
+  /// every time it runs (e.g. the same overdue withdrawal every tick).
+  @@unique([type, relatedEntityType, relatedEntityId], name: "uniq_alert_per_entity")
+  @@index([acknowledgedAt])
+  @@map("financial_alerts")
+}
+
+// ---------------------------------------------------------------------------
+// Approval workflow (multi-operator Phase 4). Changes the spec reserves for
+// Super Admin review (name, logo, theme, cartela quantity increases, bonus /
+// referral / withdrawal rules) are stored here as pending and applied only on
+// approval, by the same service method a direct change would use. Rows are
+// never deleted (trigger); status only moves forward out of "pending".
+// ---------------------------------------------------------------------------
+
+enum ApprovalStatus {
+  pending
+  approved
+  rejected
+  cancelled
+  superseded
+}
+
+model ApprovalRequest {
+  id                 String         @id @default(uuid())
+  operatorId         String         @map("operator_id")
+  operator           Operator       @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  /// See approvals/approval-policy.ts for the catalog.
+  type               String
+  /// Distinguishes concurrent requests of one type (e.g. a room id, a settings key). "" when the type has one target per operator.
+  targetKey          String         @default("") @map("target_key")
+  /// Live value when submitted; approval refuses to apply if the live value has since changed.
+  currentValue       Json?          @map("current_value")
+  proposedValue      Json           @map("proposed_value")
+  status             ApprovalStatus @default(pending)
+  submittedByAdminId String         @map("submitted_by_admin_id")
+  submittedAt        DateTime       @default(now()) @map("submitted_at")
+  reviewedByAdminId  String?        @map("reviewed_by_admin_id")
+  reviewedAt         DateTime?      @map("reviewed_at")
+  reviewNote         String?        @map("review_note")
+  appliedAt          DateTime?      @map("applied_at")
+
+  @@index([status, submittedAt])
+  @@index([operatorId, status])
+  @@map("approval_requests")
+}
+
+/// In-app notifications. audience "platform" = Super Admin / platform admins;
+/// "operator" = that operator's admins.
+model Notification {
+  id                String    @id @default(uuid())
+  audience          String
+  operatorId        String?   @map("operator_id")
+  operator          Operator? @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  type              String
+  severity          String    @default("info")
+  title             String
+  body              String?
+  relatedEntityType String?   @map("related_entity_type")
+  relatedEntityId   String?   @map("related_entity_id")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  readAt            DateTime? @map("read_at")
+  readByAdminId     String?   @map("read_by_admin_id")
+
+  @@index([audience, readAt, createdAt])
+  @@index([operatorId, audience, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Support tickets + FAQ (multi-operator Phase 4b). A ticket belongs to the
+// player's own operator and is handled by that operator's staff.
+// ---------------------------------------------------------------------------
+
+enum TicketStatus {
+  open
+  pending
+  resolved
+  closed
+}
+
+model SupportTicket {
+  id              String       @id @default(uuid())
+  operatorId      String       @map("operator_id")
+  operator        Operator     @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  telegramUserId  String       @map("telegram_user_id")
+  user            TelegramUser @relation(fields: [telegramUserId], references: [id], onDelete: Restrict)
+  subject         String
+  status          TicketStatus @default(open)
+  priority        String       @default("normal")
+  assignedAdminId String?      @map("assigned_admin_id")
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+  lastMessageAt   DateTime     @default(now()) @map("last_message_at")
+
+  messages SupportTicketMessage[]
+
+  @@index([operatorId, status, lastMessageAt])
+  @@index([telegramUserId, createdAt])
+  @@map("support_tickets")
+}
+
+model SupportTicketMessage {
+  id         String        @id @default(uuid())
+  ticketId   String        @map("ticket_id")
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  authorType String        @map("author_type") // "player" | "admin"
+  authorId   String        @map("author_id")
+  body       String
+  createdAt  DateTime      @default(now()) @map("created_at")
+
+  @@index([ticketId, createdAt])
+  @@map("support_ticket_messages")
+}
+
+model FaqEntry {
+  id         String   @id @default(uuid())
+  operatorId String   @map("operator_id")
+  operator   Operator @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+  question   String
+  answer     String
+  sortOrder  Int      @default(0) @map("sort_order")
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([operatorId, isActive, sortOrder])
+  @@map("faq_entries")
+}
+
+// ---------------------------------------------------------------------------
+// Platform billing — records each subscription payment made by an operator.
+// Allows the Super Admin to track SaaS revenue without relying on a third-party
+// payment provider integration (manual/offline payments are the expected first
+// implementation for an Ethiopian operator).
+// ---------------------------------------------------------------------------
+
+model SubscriptionPayment {
+  id             String   @id @default(uuid())
+  operatorId     String   @map("operator_id")
+  planId         String   @map("plan_id")
+  amountMinor    Int      @map("amount_minor")
+  currency       String   @default("ETB")
+  status         String   @default("pending") // pending, paid, failed, refunded
+  periodStart    DateTime @map("period_start")
+  periodEnd      DateTime @map("period_end")
+  paidAt         DateTime? @map("paid_at")
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  operator       Operator         @relation(fields: [operatorId], references: [id])
+  plan           SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  @@index([operatorId])
+  @@map("subscription_payments")
+}

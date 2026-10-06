@@ -1,0 +1,117 @@
+# Production stack — Caddy is the only container exposed to the internet
+# (ports 80/443). Postgres, backend and frontend are reachable only on
+# the internal Docker network. Redis is intentionally omitted: it is not
+# used by the backend (no Redis client in backend/src) and would be dead
+# infrastructure. Add it back only when a Redis-backed feature (session
+# store, distributed rate-limiting) is actually wired in.
+#
+# Usage:
+#   cp .env.example .env          # fill in real secrets — see README below
+#   echo "DOMAIN=bingo.yourdomain.com" >> .env
+#   echo "CADDY_EMAIL=you@yourdomain.com" >> .env
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# DNS for DOMAIN must already point at this host's public IP before first
+# start, or Caddy's automatic Let's Encrypt certificate request will fail.
+# docker-compose.yml (the local-dev file) is untouched by this file — they
+# are two independent, complete compose files, not one layered on the other.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-yena_bingo}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No `ports:` — reachable only from other containers on this network,
+    # not from the host or the internet.
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # The app itself connects as the restricted, RLS-scoped app_runtime role
+      # — never as the postgres superuser, which bypasses every RLS policy
+      # unconditionally (Postgres does not allow RLS to restrict a superuser
+      # at all). MIGRATE_DATABASE_URL (superuser) is used only by
+      # `prisma migrate deploy`/seed's initial role-password step at startup
+      # — see backend/prisma/schema.prisma's `directUrl` and
+      # docker-entrypoint.sh. Both must point at the same database.
+      DATABASE_URL: postgresql://app_runtime:${APP_RUNTIME_PASSWORD:?APP_RUNTIME_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-yena_bingo}
+      MIGRATE_DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-yena_bingo}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?APP_RUNTIME_PASSWORD must be set}
+      PORT: 3000
+      CORS_ALLOWED_ORIGINS: https://${DOMAIN:?DOMAIN must be set}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET must be set}
+      ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:?TELEGRAM_BOT_USERNAME must be set}
+      # Finding SEC/BOT (Critical): this was missing from the prod compose
+      # entirely. TelegramService.verifyWebhookSecret() fails CLOSED when this
+      # is unset (empty string never matches), so every webhook delivery from
+      # Telegram would be rejected as Unauthorized in a real deployment from
+      # this file as it stood — the bot would be completely non-functional,
+      # not just insecure. Generate with `openssl rand -hex 32`.
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?TELEGRAM_WEBHOOK_SECRET must be set — generate with `openssl rand -hex 32`}
+      # Encrypts operators' own bot tokens at rest (openssl rand -base64 32). Required once any
+      # non-default operator has a bot; optional until then. Back it up apart from DB dumps.
+      PLATFORM_ENCRYPTION_KEY: ${PLATFORM_ENCRYPTION_KEY:-}
+      YENA_BINGO_APP_URL: https://${DOMAIN:?DOMAIN must be set}
+      ALLOW_UNVERIFIED_TELEGRAM: "false"
+      RECEIPTS_STORAGE_PATH: /app/storage/receipts
+      # Finding DEVOPS-1 (High): PUBLIC_STORAGE_PATH had no env override and no
+      # volume here — theme logos/banners uploaded via the admin panel were
+      # written to the container's ephemeral filesystem and would be silently
+      # LOST on every redeploy/restart. Now persisted the same way receipts are.
+      PUBLIC_STORAGE_PATH: /app/storage/public
+      # Optional — Sentry stays a documented no-op if left unset (see main.ts).
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    volumes:
+      - receipts_data:/app/storage/receipts
+      - public_storage_data:/app/storage/public
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: https://${DOMAIN:?DOMAIN must be set}/api
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set}
+      CADDY_EMAIL: ${CADDY_EMAIL:?CADDY_EMAIL must be set}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  receipts_data:
+  public_storage_data:
+  caddy_data:
+  caddy_config:

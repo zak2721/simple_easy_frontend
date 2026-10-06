@@ -1,0 +1,18 @@
+# Never bake local .env files into the image.
+# VITE_* vars in .env are embedded at build time — a dev .env with
+# VITE_DEV_TELEGRAM_USER would bypass Telegram auth in the production bundle.
+.env
+.env.local
+.env.*.local
+
+# Backend runtime secrets — never needed by the frontend build
+backend/.env
+backend/.env.local
+backend/.env.*.local
+
+# Dev artefacts
+node_modules
+backend/node_modules
+.git
+coverage
+dist

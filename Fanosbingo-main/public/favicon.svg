@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="የኛ bingo">
+  <rect width="64" height="64" rx="14" fill="#0b7d3e"/>
+  <circle cx="32" cy="30" r="17" fill="#fff"/>
+  <path d="M32 16l5 4-2 6h-6l-2-6z" fill="#0b7d3e"/>
+  <path d="M32 44l-5-4 2-6h6l2 6z" fill="#0b7d3e"/>
+  <text x="32" y="59" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="800" fill="#ffd166">B</text>
+</svg>
